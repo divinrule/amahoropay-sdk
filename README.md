@@ -18,7 +18,7 @@ Fonctionne tel quel en **Vanilla JS**, **React**, **Next.js** et **React Native*
 
 Version fixe : `@v1.0.0`. Dernière du majeur : `@v1`. Toujours la branche : `@master`.
 
-### React / Next.js
+### React / Next.js / React Native
 
 Copiez `amahoropay-sdk.js` dans votre projet (`src/lib/amahoropay-sdk.js`) puis :
 
@@ -26,11 +26,14 @@ Copiez `amahoropay-sdk.js` dans votre projet (`src/lib/amahoropay-sdk.js`) puis 
 import { createAmahoroPay } from '../lib/amahoropay-sdk';
 ```
 
+React Native : le wallet (WalletConnect, MetaMask SDK mobile) fournit un provider EIP-1193. Injectez-le via `sdk.connect(provider)` au moment de la connexion.
+
 ## Configuration
 
 ```js
 const pay = createAmahoroPay({
     ethers,                                 // instance ethers (globale UMD ou `import { ethers } from 'ethers'`)
+    ethereum,                               // optionnel : provider EIP-1193 injecté (MetaMask ou WalletConnect)
     gatewayAddress: '0x…',                  // adresse du contrat AmahoroGateway
     tokenAddress:   '0x…',                  // adresse du token AMHR
     gatewayAbi:     undefined,              // optionnel : ABI custom (sinon ABI minimale embarquée)
@@ -46,7 +49,7 @@ const pay = createAmahoroPay({
 
 | Méthode | Description |
 |---|---|
-| `connect()` | Connexion MetaMask (retourne `{ provider, signer, address }`) |
+| `connect(providerOverride?)` | Connexion wallet : sans arg = MetaMask (`window.ethereum`), avec arg = provider EIP-1193 injecté (RN/WalletConnect). Retourne `{ provider, signer, address }` |
 | `ensureChain()` | Vérifie `chainIdExpected` (throw si mauvais réseau) |
 | `createCheckout(payer, amountTokens, expiry)` | Crée un checkout (payer = bénéficiaire) |
 | `payCheckout(checkoutId)` | Paye un checkout |

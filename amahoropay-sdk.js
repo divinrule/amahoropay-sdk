@@ -1,6 +1,7 @@
 export function createAmahoroPay(config) {
     const {
         ethers,
+        ethereum,
         gatewayAddress,
         tokenAddress,
         gatewayAbi = MINIMAL_GATEWAY_ABI,
@@ -24,6 +25,13 @@ export function createAmahoroPay(config) {
         if (injected) return injected;
         if (typeof globalThis !== 'undefined' && globalThis.ethers) return globalThis.ethers;
         throw new Error('Ethers introuvable. Passez l\'instance ethers via la config (config.ethers).');
+    }
+
+    function _ethereum() {
+        if (ethereum) return ethereum;
+        if (typeof window !== 'undefined' && window.ethereum) return window.ethereum;
+        if (typeof globalThis !== 'undefined' && globalThis.ethereum) return globalThis.ethereum;
+        return null;
     }
 
     function _requireConnected() {
@@ -87,12 +95,13 @@ export function createAmahoroPay(config) {
         return explorers[_chainId] || 'https://etherscan.io/tx/';
     }
 
-    async function connect() {
-        if (typeof window === 'undefined' || !window.ethereum) {
-            throw new Error('MetaMask non détecté. Installez MetaMask pour continuer.');
+    async function connect(providerOverride) {
+        const eth = providerOverride || _ethereum();
+        if (!eth) {
+            throw new Error('Wallet non détecté. Installez MetaMask ou passez un provider EIP-1193 via config.ethereum ou connect(provider).');
         }
 
-        _provider = new E.BrowserProvider(window.ethereum);
+        _provider = new E.BrowserProvider(eth);
         const accounts = await _provider.send('eth_requestAccounts', []);
         _signer = await _provider.getSigner();
         _address = accounts[0];
@@ -339,8 +348,9 @@ export function createAmahoroPay(config) {
     }
 
     function onAccountChanged(callback) {
-        if (typeof window === 'undefined' || !window.ethereum) return;
-        window.ethereum.on('accountsChanged', (accounts) => {
+        const eth = _ethereum();
+        if (!eth || typeof eth.on !== 'function') return;
+        eth.on('accountsChanged', (accounts) => {
             _address = accounts[0] || null;
             _signer = null;
             _gateway = null;
@@ -353,8 +363,9 @@ export function createAmahoroPay(config) {
     }
 
     function onChainChanged(callback) {
-        if (typeof window === 'undefined' || !window.ethereum) return;
-        window.ethereum.on('chainChanged', (chainIdHex) => {
+        const eth = _ethereum();
+        if (!eth || typeof eth.on !== 'function') return;
+        eth.on('chainChanged', (chainIdHex) => {
             _chainId = parseInt(chainIdHex, 16);
             _gateway = null;
             _token = null;
