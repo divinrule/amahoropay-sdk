@@ -11,12 +11,12 @@ Fonctionne tel quel en **Vanilla JS**, **React**, **Next.js** et **React Native*
 ```html
 <script src="https://cdn.jsdelivr.net/npm/ethers@6.9.0/dist/ethers.umd.min.js"></script>
 <script type="module">
-    import { createAmahoroPay } from 'https://cdn.jsdelivr.net/gh/divinrule/amahoropay-sdk@v1/amahoropay-sdk.js';
+    import { createAmahoroPay } from 'https://cdn.jsdelivr.net/gh/divinrule/amahoropay-sdk@main/amahoropay-sdk.js';
     const pay = createAmahoroPay({ ethers, gatewayAddress: '0x...', tokenAddress: '0x...' });
 </script>
 ```
 
-Version fixe : `@v1.0.0`. Dernière du majeur : `@v1`. Toujours la branche : `@master`.
+Version figée en production : remplacez `@main` par `@v1.1.0`. Autres règles : `@v1` = dernière du majeur, `@main` = dernier push (cache court).
 
 ### React / Next.js / React Native
 
