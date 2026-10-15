@@ -118,7 +118,7 @@ const pay = createAmahoroPay({
   ethers,
   gatewayAddress: '0xCeloGateway',
   tokenAddress: '0xAMHR',
-  relayUrl: 'https://yoursite.com/saas/?page=relay',
+  relayUrl: 'https://yoursite.com/?page=relay',
   apiKey: 'ak_live_...',
   chains: {
     42220: { chainId: 42220, name: 'Celo', rpc: 'https://forno.celo.org', nativeCurrency: { name: 'Celo', symbol: 'CELO', decimals: 18 }, explorer: 'https://explorer.celo.org/tx/' },
