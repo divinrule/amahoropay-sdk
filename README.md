@@ -42,7 +42,7 @@ const pay = createAmahoroPay({
     tokenAddress:   '0x…',               // AMHR token address
     gatewayAbi:     undefined,           // optional: custom gateway ABI (uses embedded minimal ABI)
     tokenAbi:       undefined,           // optional: custom token ABI
-    relayUrl:       'https://…/index.php?page=relay',  // gasless relay endpoint
+    relayUrl:       'https://…/?page=relay',  // gasless relay endpoint
     apiKey:         '',                  // API key for relay
     chainIdExpected: null,               // optional: verify network after connect
     decimals:       18,                  // token decimals (auto-fetched on connect if not provided)
