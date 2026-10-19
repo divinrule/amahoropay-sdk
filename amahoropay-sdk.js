@@ -7,10 +7,14 @@ export function createAmahoroPay(config) {
         gatewayAbi = MINIMAL_GATEWAY_ABI,
         tokenAbi = MINIMAL_TOKEN_ABI,
         relayUrl = '?page=relay',
-        apiKey = '',
         chainIdExpected = null,
         decimals = 18,
-        csrfToken = ''
+        csrfToken = '',
+        // Security options
+        maxFeeBps = 1000,           // Max fee 10% for payMerchant
+        maxBatchAmount = '1000000000000000000000000', // 1M tokens max per recipient
+        requestTimeout = 30000,     // 30s default timeout
+        maxRetries = 2              // Retry failed requests
     } = config || {};
 
     const E = _resolveEthers(ethers);
@@ -40,6 +44,7 @@ export function createAmahoroPay(config) {
     let _chainId = null;
     let _gateway = null;
     let _token = null;
+    let _decimals = decimals; // Instance-specific, not mutated globally
 
     function _resolveEthers(injected) {
         if (injected) return injected;
@@ -54,46 +59,68 @@ export function createAmahoroPay(config) {
         return null;
     }
 
+    function _validateAddress(address) {
+        const addr = String(address || '').toLowerCase();
+        if (!/^0x[a-f0-9]{40}$/.test(addr)) return false;
+        try { return E.getAddress(addr) === addr; } catch { return false; }
+    }
+
     function _requireConnected() {
         if (!_provider || !_signer || !_address) {
-            throw new Error('Wallet not connected. Call connect() first.');
+            throw { code: 'WALLET_NOT_CONNECTED', message: 'Wallet not connected. Call connect() first.' };
         }
     }
 
     function _requireGateway() {
         _requireConnected();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(String(gatewayAddress || ''))) {
-            throw new Error('Invalid gatewayAddress in config.');
+        if (!_validateAddress(gatewayAddress)) {
+            throw { code: 'INVALID_CONFIG', message: 'Invalid gatewayAddress in config.' };
         }
     }
 
     function _requireToken() {
         _requireConnected();
-        if (!/^0x[a-fA-F0-9]{40}$/.test(String(tokenAddress || ''))) {
-            throw new Error('Invalid tokenAddress in config.');
+        if (!_validateAddress(tokenAddress)) {
+            throw { code: 'INVALID_CONFIG', message: 'Invalid tokenAddress in config.' };
+        }
+    }
+
+    function _validateAmount(amount) {
+        const num = parseFloat(amount);
+        if (isNaN(num) || num <= 0 || num > 1e36) {
+            throw { code: 'INVALID_AMOUNT', message: 'Amount must be positive and <= 1e36' };
+        }
+        return amount;
+    }
+
+    function _validateFeeBps(feeBps, maxBps) {
+        if (feeBps > maxBps) {
+            throw { code: 'FEE_TOO_HIGH', message: `Fee ${feeBps} bps exceeds maximum ${maxBps} bps` };
         }
     }
 
     function _parseError(err) {
-        if (!err) return 'Unknown error';
+        if (!err) return { code: 'UNKNOWN_ERROR', message: 'Unknown error' };
         const msg = err.reason || (err.data && err.data.message) || err.message || String(err);
         const friendly = {
-            'user rejected the request.': 'Transaction rejected by the user.',
-            'insufficient funds': 'Insufficient funds for this transaction.',
-            'nonce too low': 'Nonce too low. Please retry.',
-            'replacement fee too low': 'Replacement fee too low.',
-            'already known': 'Transaction already in progress.',
-            'bad address': 'Invalid address.',
-            'checkout not found': 'Checkout not found.',
-            'checkout expired': 'Checkout expired.',
-            'checkout already paid': 'Checkout already paid.',
-            'escrow window': 'Invalid escrow window for this action.'
+            'user rejected the request.': { code: 'USER_REJECTED', message: 'Transaction rejected by the user.' },
+            'insufficient funds': { code: 'INSUFFICIENT_FUNDS', message: 'Insufficient funds for this transaction.' },
+            'nonce too low': { code: 'NONCE_TOO_LOW', message: 'Nonce too low. Please retry.' },
+            'replacement fee too low': { code: 'REPLACEMENT_FEE_TOO_LOW', message: 'Replacement fee too low.' },
+            'already known': { code: 'ALREADY_KNOWN', message: 'Transaction already in progress.' },
+            'bad address': { code: 'INVALID_ADDRESS', message: 'Invalid address.' },
+            'checkout not found': { code: 'CHECKOUT_NOT_FOUND', message: 'Checkout not found.' },
+            'checkout expired': { code: 'CHECKOUT_EXPIRED', message: 'Checkout expired.' },
+            'checkout already paid': { code: 'CHECKOUT_ALREADY_PAID', message: 'Checkout already paid.' },
+            'escrow window': { code: 'INVALID_ESCROW_WINDOW', message: 'Invalid escrow window for this action.' },
+            'relay request timed out': { code: 'NETWORK_ERROR', message: 'Relay request timed out.' },
+            'relay unreachable': { code: 'NETWORK_ERROR', message: 'Relay unreachable.' }
         };
         const lower = msg.toLowerCase();
         for (const key of Object.keys(friendly)) {
             if (lower.indexOf(key) !== -1) return friendly[key];
         }
-        return msg;
+        return { code: 'CONTRACT_ERROR', message: msg };
     }
 
     function _send(contract, method, args) {
@@ -123,36 +150,51 @@ export function createAmahoroPay(config) {
     async function connect(providerOverride) {
         const eth = providerOverride || _ethereum();
         if (!eth) {
-            throw new Error('Wallet not detected. Install MetaMask or pass an EIP-1193 provider via config.ethereum or connect(provider).');
+            throw { code: 'WALLET_NOT_DETECTED', message: 'Wallet not detected. Install MetaMask or pass an EIP-1193 provider via config.ethereum or connect(provider).' };
         }
 
-        _provider = new E.BrowserProvider(eth);
-        const accounts = await _provider.send('eth_requestAccounts', []);
-        _signer = await _provider.getSigner();
-        _address = accounts[0];
-        _chainId = Number((await _provider.getNetwork()).chainId);
-        EIP712_DOMAIN.chainId = _chainId;
-
-        // Fetch actual token decimals on-chain (overrides config default)
+        let provider = null;
         try {
-            const tokenContract = getTokenContract(_provider);
-            decimals = Number(await tokenContract.decimals());
+            provider = new E.BrowserProvider(eth);
+            const accounts = await provider.send('eth_requestAccounts', []);
+            if (!accounts || accounts.length === 0) {
+                throw { code: 'USER_REJECTED', message: 'User rejected connection request' };
+            }
+            _signer = await provider.getSigner();
+            _address = accounts[0];
+            const network = await provider.getNetwork();
+            _chainId = Number(network.chainId);
+            EIP712_DOMAIN.chainId = _chainId;
+
+            // Fetch actual token decimals on-chain (overrides config default)
+            try {
+                const tokenContract = getTokenContract(provider);
+                _decimals = Number(await tokenContract.decimals());
+            } catch (e) {
+                // Fallback to config default if token call fails
+            }
+
+            _provider = provider;
+            _gateway = null;
+            _token = null;
+
+            return { address: _address, chainId: _chainId, provider: _provider, signer: _signer };
         } catch (e) {
-            // Fallback to config default if token call fails
+            // Cleanup on failure
+            _provider = null;
+            _signer = null;
+            _address = null;
+            _chainId = null;
+            _gateway = null;
+            _token = null;
+            throw e;
         }
-
-        _gateway = null;
-        _token = null;
-
-        return { address: _address, chainId: _chainId, provider: _provider, signer: _signer };
     }
 
     function ensureChain() {
         _requireConnected();
         if (chainIdExpected && Number(chainIdExpected) !== _chainId) {
-            throw new Error(
-                `Wrong network. Expected chain ID: ${chainIdExpected}, current: ${_chainId}. Call switchChain() first.`
-            );
+            throw { code: 'WRONG_CHAIN', message: `Wrong network. Expected chain ID: ${chainIdExpected}, current: ${_chainId}. Call switchChain() first.` };
         }
         return _chainId;
     }
@@ -164,7 +206,7 @@ export function createAmahoroPay(config) {
     async function switchChain(chain) {
         const eth = _ethereum();
         if (!eth || typeof eth.request !== 'function') {
-            throw new Error('Wallet not detected or not EIP-1193 compatible.');
+            throw { code: 'WALLET_NOT_COMPATIBLE', message: 'Wallet not detected or not EIP-1193 compatible.' };
         }
 
         let target;
@@ -177,10 +219,20 @@ export function createAmahoroPay(config) {
             target = Number(chain || chainIdExpected);
         }
         if (!target) {
-            throw new Error('No target chain specified. Pass { chainId } or a registry key.');
+            throw { code: 'INVALID_CHAIN', message: 'No target chain specified. Pass { chainId } or a registry key.' };
         }
         if (!descriptor && registry && registry[target]) {
             descriptor = registry[target];
+        }
+
+        // Validate descriptor if provided
+        if (descriptor) {
+            if (descriptor.rpc && typeof descriptor.rpc !== 'string') {
+                throw { code: 'INVALID_DESCRIPTOR', message: 'descriptor.rpc must be a string' };
+            }
+            if (descriptor.nativeCurrency && typeof descriptor.nativeCurrency !== 'object') {
+                throw { code: 'INVALID_DESCRIPTOR', message: 'descriptor.nativeCurrency must be an object' };
+            }
         }
 
         const params = [{ chainId: '0x' + target.toString(16) }];
@@ -189,7 +241,7 @@ export function createAmahoroPay(config) {
         } catch (err) {
             if (err && (err.code === 4902 || (err.data && err.data.originalError && err.data.originalError.code === 4902))) {
                 if (!descriptor || !descriptor.rpc) {
-                    throw new Error('Chain not in the wallet and no RPC descriptor provided to add it.');
+                    throw { code: 'CHAIN_NOT_IN_WALLET', message: 'Chain not in the wallet and no RPC descriptor provided to add it.' };
                 }
                 await eth.request({
                     method: 'wallet_addEthereumChain',
@@ -203,7 +255,7 @@ export function createAmahoroPay(config) {
                 });
                 await eth.request({ method: 'wallet_switchEthereumChain', params });
             } else {
-                throw err;
+                throw { code: 'SWITCH_CHAIN_FAILED', message: err.message || String(err) };
             }
         }
 
@@ -245,15 +297,12 @@ export function createAmahoroPay(config) {
         try {
             if (E.randomBytes) return E.hexlify(E.randomBytes(32));
         } catch (e) { /* fallthrough */ }
-        let hex = '';
-        const arr = new Uint8Array(32);
-        if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-            crypto.getRandomValues(arr);
-        } else {
-            for (let i = 0; i < 32; i++) arr[i] = Math.floor(Math.random() * 256);
+        if (typeof crypto === 'undefined' || !crypto.getRandomValues) {
+            throw { code: 'CRYPTO_NOT_AVAILABLE', message: 'Secure random requires crypto.getRandomValues (HTTPS context)' };
         }
-        arr.forEach((b) => { hex += b.toString(16).padStart(2, '0'); });
-        return '0x' + hex;
+        const arr = new Uint8Array(32);
+        crypto.getRandomValues(arr);
+        return '0x' + Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
     async function getAMHRBalance(address) {
@@ -262,7 +311,7 @@ export function createAmahoroPay(config) {
         const token = getTokenContract();
         const addr = address || _address;
         const balance = await token.balanceOf(addr);
-        return E.formatUnits(balance, decimals);
+        return E.formatUnits(balance, _decimals);
     }
 
     async function getAllowance(owner, spender) {
@@ -281,7 +330,7 @@ export function createAmahoroPay(config) {
     async function approveGateway(amountTokens) {
         _requireConnected();
         _requireToken();
-        const weiAmount = E.parseUnits(String(amountTokens), decimals);
+        const weiAmount = E.parseUnits(String(amountTokens), _decimals);
         const token = getTokenContract();
         const tx = await _send(token, 'approve', [gatewayAddress, weiAmount]);
         return { tx, receipt: await _wait(tx) };
@@ -290,12 +339,13 @@ export function createAmahoroPay(config) {
     // ── Checkout: reserved payment with guaranteed price ────────────────
     // The contract checks that `merchant` is a registered merchant; the
     // payer then signs payCheckout(checkoutId, ref) (transferFrom).
-    async function createCheckout(payer, merchant, amountTokens, expiry) {
+    async function createCheckout(params) {
         _requireConnected();
+        _validateAmount(params.amount);
         const gateway = _freshGateway();
-        const weiAmount = E.parseUnits(String(amountTokens), decimals);
+        const weiAmount = E.parseUnits(String(params.amount), _decimals);
 
-        const tx = await _send(gateway, 'createCheckout', [payer, merchant, weiAmount, _toSeconds(expiry)]);
+        const tx = await _send(gateway, 'createCheckout', [params.payer, params.merchant, weiAmount, _toSeconds(params.expiresAt)]);
         const receipt = await _wait(tx);
 
         const checkoutId = _parseId(receipt, gateway, 'CheckoutCreated', 'checkoutId');
@@ -322,8 +372,8 @@ export function createAmahoroPay(config) {
         const c = await gateway.checkouts(checkoutId);
         return {
             payer: c[0], merchant: c[1],
-            amount: E.formatUnits(c[2], decimals),
-            fee: E.formatUnits(c[3], decimals),
+            amount: E.formatUnits(c[2], _decimals),
+            fee: E.formatUnits(c[3], _decimals),
             expiresAt: Number(c[4]),
             paid: c[5], cancelled: c[6]
         };
@@ -332,14 +382,15 @@ export function createAmahoroPay(config) {
     // ── Escrow: third party holding with time windows ───────────────────
     // releaseDelay: seconds before the merchant can release;
     // expiresDelay: seconds after which the payer can refund themselves.
-    async function createEscrow(merchant, amountTokens, ref, releaseDelaySec, expiresDelaySec) {
+    async function createEscrow(params) {
         _requireConnected();
+        _validateAmount(params.amount);
         const gateway = _freshGateway();
-        const weiAmount = E.parseUnits(String(amountTokens), decimals);
+        const weiAmount = E.parseUnits(String(params.amount), _decimals);
 
         const tx = await _send(gateway, 'createEscrow', [
-            _address, merchant, weiAmount, ref || ZERO32,
-            Math.floor(releaseDelaySec), Math.floor(expiresDelaySec)
+            _address, params.merchant, weiAmount, params.ref || ZERO32,
+            Math.floor(params.releaseDelaySec), Math.floor(params.expiresDelaySec)
         ]);
         const receipt = await _wait(tx);
 
@@ -391,8 +442,8 @@ export function createAmahoroPay(config) {
         const e = await gateway.escrows(escrowId);
         return {
             payer: e[0], merchant: e[1],
-            amount: E.formatUnits(e[2], decimals),
-            fee: E.formatUnits(e[3], decimals),
+            amount: E.formatUnits(e[2], _decimals),
+            fee: E.formatUnits(e[3], _decimals),
             ref: e[4],
             releaseAt: Number(e[5]),
             expiresAt: Number(e[6]),
@@ -401,21 +452,26 @@ export function createAmahoroPay(config) {
     }
 
     // ── Paiement direct marchand (avec approbation gateway) ─────────────
-    async function payMerchant(merchant, amountTokens, ref) {
+    async function payMerchant(params) {
         _requireConnected();
         _requireToken();
+        _validateAmount(params.amount);
         const gateway = _freshGateway();
-        const weiAmount = E.parseUnits(String(amountTokens), decimals);
+        const weiAmount = E.parseUnits(String(params.amount), _decimals);
 
+        // Fix: approve amount + fee (not just amount)
         const token = getTokenContract();
+        const fee = await gateway.quoteMerchantFee(weiAmount);
+        _validateFeeBps(Number(fee) * 10000 / Number(weiAmount), maxFeeBps); // Convert to bps and validate
+        const totalWei = weiAmount + fee;
         const allowance = await token.allowance(_address, gatewayAddress);
-        if (allowance < weiAmount) {
-            const approveTx = await _send(token, 'approve', [gatewayAddress, weiAmount]);
+        if (allowance < totalWei) {
+            const approveTx = await _send(token, 'approve', [gatewayAddress, totalWei]);
             await _wait(approveTx);
         }
 
-        const method = ref ? 'payMerchantWithReference' : 'payMerchant';
-        const tx = await _send(gateway, method, ref ? [merchant, weiAmount, ref] : [merchant, weiAmount]);
+        const method = params.ref ? 'payMerchantWithReference' : 'payMerchant';
+        const tx = await _send(gateway, method, params.ref ? [params.merchant, weiAmount, params.ref] : [params.merchant, weiAmount]);
         return { tx, receipt: await _wait(tx) };
     }
 
@@ -430,21 +486,42 @@ export function createAmahoroPay(config) {
 
     // ── Batch Payouts (Merchant → Multiple Recipients) ────────────────────
     // fundingSource must approve gateway for fee AND guard for batchTotal.
-    async function batchPayout(fundingSource, recipients, amounts, ref) {
+    async function batchPayout(params) {
         _requireConnected();
         _requireToken();
         const gateway = _freshGateway();
 
         const token = getTokenContract();
-        const totalAmount = amounts.reduce((sum, a) => sum + a, 0);
-        const fee = await gateway.quoteBatchFee(totalAmount);
+        
+        // Validate amounts
+        if (!params.amounts || !Array.isArray(params.amounts) || params.amounts.length === 0) {
+            throw { code: 'INVALID_AMOUNTS', message: 'amounts array required' };
+        }
+        if (!params.recipients || !Array.isArray(params.recipients) || params.recipients.length !== params.amounts.length) {
+            throw { code: 'INVALID_RECIPIENTS', message: 'recipients array must match amounts length' };
+        }
+        
+        // Validate each amount and recipient
+        for (let i = 0; i < params.amounts.length; i++) {
+            _validateAmount(params.amounts[i]);
+            if (BigInt(params.amounts[i]) > BigInt(maxBatchAmount)) {
+                throw { code: 'AMOUNT_TOO_LARGE', message: `Amount at index ${i} exceeds maximum` };
+            }
+            if (!_validateAddress(params.recipients[i])) {
+                throw { code: 'INVALID_ADDRESS', message: `Invalid recipient address at index ${i}` };
+            }
+        }
+        
+        // Fix: Use BigInt for amounts to avoid string concatenation bug
+        const totalAmount = params.amounts.reduce((sum, a) => sum + BigInt(a), BigInt(0));
+        const fee = await gateway.quoteBatchFee(totalAmount.toString());
 
         // Ensure fundingSource has approved guard for totalAmount AND gateway for fee
         // (Caller must handle approvals off-SDK or via approveGateway)
-        const method = ref ? 'batchPayoutWithReference' : 'batchPayout';
-        const args = ref
-            ? [fundingSource, recipients, amounts, ref]
-            : [fundingSource, recipients, amounts];
+        const method = params.ref ? 'batchPayoutWithReference' : 'batchPayout';
+        const args = params.ref
+            ? [params.fundingSource, params.recipients, params.amounts, params.ref]
+            : [params.fundingSource, params.recipients, params.amounts];
         const tx = await _send(gateway, method, args);
         return { tx, receipt: await _wait(tx) };
     }
@@ -457,8 +534,24 @@ export function createAmahoroPay(config) {
     async function signTransferWithAuthorization(from, to, valueTokens, validAfterSec, validBeforeSec, nonce, domainName, domainVersion) {
         _requireConnected();
         _requireToken();
+        _validateAmount(valueTokens);
 
         from = from || _address;
+        
+        // Validate chainId at sign time (not from cached _chainId which may be stale)
+        let currentChainId = _chainId;
+        if (_provider) {
+            try {
+                const network = await _provider.getNetwork();
+                currentChainId = Number(network.chainId);
+            } catch (e) {
+                // Fallback to cached
+            }
+        }
+        if (chainIdExpected && currentChainId !== chainIdExpected) {
+            throw { code: 'WRONG_CHAIN', message: `Expected chain ${chainIdExpected}, current ${currentChainId}` };
+        }
+
         const now = Math.floor(Date.now() / 1000);
         const validAfter = typeof validAfterSec === 'number'
             ? Math.floor(validAfterSec)
@@ -466,19 +559,19 @@ export function createAmahoroPay(config) {
         const validBefore = typeof validBeforeSec === 'number'
             ? Math.floor(validBeforeSec)
             : now + 3600;
-        const value = E.parseUnits(String(valueTokens), decimals);
+        const value = E.parseUnits(String(valueTokens), _decimals);
 
         // Replay-protection nonce: left to the signer (bytes32), verified
         // on-chain via authorizationState. Generated randomly if omitted.
         const nonce32 = nonce || _randomBytes32();
         if (!/^0x[a-fA-F0-9]{64}$/.test(nonce32)) {
-            throw new Error('invalid nonce. Must be a hex bytes32 (0x + 64 hex).');
+            throw { code: 'INVALID_NONCE', message: 'Nonce must be a hex bytes32 (0x + 64 hex)' };
         }
 
         const domain = {
             name: domainName || 'Amahoro',
             version: domainVersion || '1',
-            chainId: _chainId,
+            chainId: currentChainId,
             verifyingContract: tokenAddress
         };
         const message = { from, to, value, validAfter, validBefore, nonce: nonce32 };
@@ -500,6 +593,18 @@ export function createAmahoroPay(config) {
 
     async function relayTransfer(params) {
         _requireConnected();
+        
+        // Verify signature locally before sending (defense in depth)
+        const recovered = E.verifyTypedData(
+            { name: 'Amahoro', version: '1', chainId: _chainId, verifyingContract: tokenAddress },
+            TRANSFER_WITH_AUTH_TYPES,
+            { from: params.from, to: params.to, value: params.value, validAfter: params.validAfter, validBefore: params.validBefore, nonce: params.nonce },
+            params.signature
+        );
+        if (recovered.toLowerCase() !== params.from.toLowerCase()) {
+            throw { code: 'INVALID_SIGNATURE', message: 'Signature does not match from address' };
+        }
+
         const body = {
             from: params.from,
             to: params.to,
@@ -514,41 +619,61 @@ export function createAmahoroPay(config) {
         if (params.ref) body.ref = String(params.ref);
 
         const headers = { 'Content-Type': 'application/json' };
-        if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+        // SECURITY: Do NOT send API key from the browser.
+        // The SDK expects a backend proxy to add the Authorization header.
+        // If you need direct relay access, use a server-side endpoint.
 
         let resp;
-        try {
-            resp = await fetch(relayUrl, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(body)
-            });
-        } catch (e) {
-            throw new Error('Relay unreachable: ' + e.message);
+        let lastError;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), requestTimeout);
+                
+                resp = await fetch(relayUrl, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(body),
+                    signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                break;
+            } catch (e) {
+                lastError = e;
+                if (e.name === 'AbortError') {
+                    throw { code: 'TIMEOUT', message: `Request timed out after ${requestTimeout}ms` };
+                }
+                if (attempt === maxRetries) {
+                    throw { code: 'NETWORK_ERROR', message: `Relay unreachable after ${maxRetries + 1} attempts: ${e.message}` };
+                }
+                // Exponential backoff
+                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+            }
         }
 
         let data;
         try {
             data = await resp.json();
         } catch (e) {
-            throw new Error(`Invalid relay response (HTTP ${resp.status}).`);
+            throw { code: 'INVALID_RESPONSE', message: `Invalid relay response (HTTP ${resp.status})` };
         }
 
         if (!resp.ok) {
-            throw new Error(data.error || data.message || `Relay failed (HTTP ${resp.status})`);
+            throw { code: 'RELAY_FAILED', message: data.error || data.message || `Relay failed (HTTP ${resp.status})` };
         }
         if (data.success === false) {
-            throw new Error(data.message || 'Relay refused (nonce already used?).');
+            throw { code: 'RELAY_REFUSED', message: data.message || 'Relay refused (nonce already used?)' };
         }
         return data;
     }
 
     function parseAmount(tokens) {
-        return E.parseUnits(String(tokens), decimals);
+        return E.parseUnits(String(tokens), _decimals);
     }
 
     function formatAmount(wei) {
-        return E.formatUnits(String(wei), decimals);
+        return E.formatUnits(String(wei), _decimals);
     }
 
     function formatAddress(address) {
@@ -557,58 +682,105 @@ export function createAmahoroPay(config) {
     }
 
     // ── List API methods (server-side paginated lists) ────────────────────
+    async function _fetchWithTimeout(url, options = {}, timeout = requestTimeout) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        try {
+            const resp = await fetch(url, { ...options, signal: controller.signal });
+            clearTimeout(timeoutId);
+            return resp;
+        } catch (e) {
+            clearTimeout(timeoutId);
+            if (e.name === 'AbortError') {
+                throw { code: 'TIMEOUT', message: `Request timed out after ${timeout}ms` };
+            }
+            throw { code: 'NETWORK_ERROR', message: e.message };
+        }
+    }
+
     async function listCheckouts(params = {}) {
         _requireConnected();
-        const url = new URL(window.location.origin + window.location.pathname);
+        const baseUrl = (typeof window !== 'undefined' && window.location) 
+            ? window.location.origin + window.location.pathname 
+            : '';
+        if (!baseUrl) {
+            throw { code: 'INVALID_ENVIRONMENT', message: 'listCheckouts requires browser environment or explicit baseUrl config' };
+        }
+        const url = new URL(baseUrl);
         url.searchParams.set('page', 'checkouts');
         url.searchParams.set('format', 'json');
         if (params.limit) url.searchParams.set('limit', params.limit);
         if (params.offset) url.searchParams.set('offset', params.offset);
 
-        const resp = await fetch(url.toString(), {
+        const resp = await _fetchWithTimeout(url.toString(), {
             headers: { 'Accept': 'application/json', 'X-CSRF-Token': csrfToken }
         });
-        if (!resp.ok) throw new Error('Failed to load checkouts');
+        if (!resp.ok) throw { code: 'SERVER_ERROR', message: `Failed to load checkouts (HTTP ${resp.status})` };
         const data = await resp.json();
-        if (!data.success) throw new Error(data.error || 'Failed to load checkouts');
+        if (!data.success) throw { code: 'SERVER_ERROR', message: data.error || 'Failed to load checkouts' };
         return data.data;
     }
 
     async function listEscrows(params = {}) {
         _requireConnected();
-        const url = new URL(window.location.origin + window.location.pathname);
+        const baseUrl = (typeof window !== 'undefined' && window.location) 
+            ? window.location.origin + window.location.pathname 
+            : '';
+        if (!baseUrl) {
+            throw { code: 'INVALID_ENVIRONMENT', message: 'listEscrows requires browser environment or explicit baseUrl config' };
+        }
+        const url = new URL(baseUrl);
         url.searchParams.set('page', 'escrows');
         url.searchParams.set('format', 'json');
         if (params.limit) url.searchParams.set('limit', params.limit);
         if (params.offset) url.searchParams.set('offset', params.offset);
 
-        const resp = await fetch(url.toString(), {
+        const resp = await _fetchWithTimeout(url.toString(), {
             headers: { 'Accept': 'application/json', 'X-CSRF-Token': csrfToken }
         });
-        if (!resp.ok) throw new Error('Failed to load escrows');
+        if (!resp.ok) throw { code: 'SERVER_ERROR', message: `Failed to load escrows (HTTP ${resp.status})` };
         const data = await resp.json();
-        if (!data.success) throw new Error(data.error || 'Failed to load escrows');
+        if (!data.success) throw { code: 'SERVER_ERROR', message: data.error || 'Failed to load escrows' };
         return data.data;
     }
 
     async function listBatches(params = {}) {
         _requireConnected();
-        const url = new URL(window.location.origin + window.location.pathname);
+        const baseUrl = (typeof window !== 'undefined' && window.location) 
+            ? window.location.origin + window.location.pathname 
+            : '';
+        if (!baseUrl) {
+            throw { code: 'INVALID_ENVIRONMENT', message: 'listBatches requires browser environment or explicit baseUrl config' };
+        }
+        const url = new URL(baseUrl);
         url.searchParams.set('page', 'batch-payouts');
         url.searchParams.set('format', 'json');
         if (params.limit) url.searchParams.set('limit', params.limit);
         if (params.offset) url.searchParams.set('offset', params.offset);
 
-        const resp = await fetch(url.toString(), {
+        const resp = await _fetchWithTimeout(url.toString(), {
             headers: { 'Accept': 'application/json', 'X-CSRF-Token': csrfToken }
         });
-        if (!resp.ok) throw new Error('Failed to load batches');
+        if (!resp.ok) throw { code: 'SERVER_ERROR', message: `Failed to load batches (HTTP ${resp.status})` };
         const data = await resp.json();
-        if (!data.success) throw new Error(data.error || 'Failed to load batches');
+        if (!data.success) throw { code: 'SERVER_ERROR', message: data.error || 'Failed to load batches' };
         return data.data;
     }
 
-    function onAccountChanged(callback) {
+    // ── Registration API (for backend integration) ────────────────────────
+    // NOTE: Registration endpoints require API keys and should be called from
+    // a trusted backend, not from the browser. Use the server-side PHP endpoints
+    // directly or implement a backend proxy.
+    //
+    // Available endpoints:
+    // POST /?page=api-register-checkout  - Register on-chain checkout
+    // POST /?page=api-register-escrow    - Register on-chain escrow
+    // POST /?page=api-register-batch     - Register on-chain batch payout
+    //
+    // All require: Authorization: Bearer <apiKey>, Content-Type: application/json
+    // Body fields match the SDK create* method params (snake_case)
+
+function onAccountChanged(callback) {
         const eth = _ethereum();
         if (!eth || typeof eth.on !== 'function') return;
         eth.on('accountsChanged', (accounts) => {
@@ -695,6 +867,86 @@ export function createAmahoroPay(config) {
 
         _parseError
     };
+}
+
+/**
+ * Async factory that fetches SDK config from a backend endpoint
+ * Usage:
+ *   const pay = await createAmahoroPayAsync({
+ *     configUrl: 'https://yourdomain.com/?page=api-config',
+ *     ethers,
+ *     ethereum,
+ *     apiKey: 'ak_your_key',  // optional, for authenticated endpoints
+ *     csrfToken: '...'        // optional, for CSRF protection
+ *   });
+ */
+export async function createAmahoroPayAsync(config) {
+    const {
+        configUrl,
+        ethers,
+        ethereum,
+        apiKey,
+        csrfToken,
+        // Override options (will merge with fetched config)
+        gatewayAddress,
+        tokenAddress,
+        gatewayAbi = MINIMAL_GATEWAY_ABI,
+        tokenAbi = MINIMAL_TOKEN_ABI,
+        relayUrl = '?page=relay',
+        chainIdExpected = null,
+        decimals = 18,
+        csrfToken: csrfTokenOverride,
+        // Security options
+        maxFeeBps = 1000,
+        maxBatchAmount = '1000000000000000000000000',
+        requestTimeout = 30000,
+        maxRetries = 2
+    } = config || {};
+
+    if (!configUrl) {
+        throw new Error('configUrl is required for createAmahoroPayAsync');
+    }
+
+    // Fetch config from backend
+    const headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    };
+    if (apiKey) {
+        headers['Authorization'] = 'Bearer ' + apiKey;
+    }
+    if (csrfTokenOverride) {
+        headers['X-CSRF-Token'] = csrfTokenOverride;
+    }
+
+    const response = await fetch(configUrl, { headers });
+    if (!response.ok) {
+        throw new Error(`Failed to fetch SDK config: HTTP ${response.status}`);
+    }
+    const result = await response.json();
+    if (!result.success || !result.data) {
+        throw new Error('Invalid config response: ' + (result.error || 'unknown error'));
+    }
+
+    const serverConfig = result.data;
+
+    // Merge server config with overrides
+    return createAmahoroPay({
+        ethers,
+        ethereum,
+        gatewayAddress: gatewayAddress || serverConfig.gatewayAddress,
+        tokenAddress: tokenAddress || serverConfig.tokenAddress,
+        gatewayAbi,
+        tokenAbi,
+        relayUrl: relayUrl || serverConfig.relayUrl,
+        chainIdExpected: chainIdExpected ?? serverConfig.chainIdExpected,
+        decimals: decimals ?? serverConfig.decimals,
+        csrfToken: csrfTokenOverride,
+        maxFeeBps,
+        maxBatchAmount,
+        requestTimeout,
+        maxRetries,
+    });
 }
 
 const MINIMAL_GATEWAY_ABI = [
