@@ -7,9 +7,11 @@ export function createAmahoroPay(config) {
         gatewayAbi = MINIMAL_GATEWAY_ABI,
         tokenAbi = MINIMAL_TOKEN_ABI,
         relayUrl = '?page=relay',
+        swapRelayUrl = '?page=swap-relay',
         chainIdExpected = null,
         decimals = 18,
         csrfToken = '',
+        apiKey = '',
         // Security options
         maxFeeBps = 1000,           // Max fee 10% for payMerchant
         maxBatchAmount = '1000000000000000000000000', // 1M tokens max per recipient
@@ -619,6 +621,9 @@ export function createAmahoroPay(config) {
         if (params.ref) body.ref = String(params.ref);
 
         const headers = { 'Content-Type': 'application/json' };
+        if (apiKey) {
+            headers['Authorization'] = 'Bearer ' + apiKey;
+        }
         // SECURITY: Do NOT send API key from the browser.
         // The SDK expects a backend proxy to add the Authorization header.
         // If you need direct relay access, use a server-side endpoint.
@@ -664,6 +669,78 @@ export function createAmahoroPay(config) {
         }
         if (data.success === false) {
             throw { code: 'RELAY_REFUSED', message: data.message || 'Relay refused (nonce already used?)' };
+        }
+        return data;
+    }
+
+    // ── Escrow confirmation (server-side DB flip after on-chain proof) ─────
+    // Call after depositEscrow()/releaseEscrow()/refundEscrow() to record the
+    // action in the SaaS DB once the on-chain event is confirmed.
+    async function confirmEscrowAction(params) {
+        const { escrowId, txHash, actor, action } = params || {};
+        if (!escrowId || !txHash || !action) {
+            throw { code: 'INVALID_PARAMS', message: 'escrowId, txHash and action are required.' };
+        }
+        if (!/^0x[a-fA-F0-9]{64}$/i.test(escrowId)) {
+            throw { code: 'INVALID_ESCROW_ID', message: 'escrowId must be a bytes32 hex string.' };
+        }
+        if (!/^0x[a-fA-F0-9]{64}$/i.test(txHash)) {
+            throw { code: 'INVALID_TX_HASH', message: 'txHash must be a 32-byte hex string.' };
+        }
+        if (!['deposit', 'release', 'refund'].includes(action)) {
+            throw { code: 'INVALID_ACTION', message: 'action must be deposit, release or refund.' };
+        }
+
+        const resp = await _fetchWithTimeout('?page=escrow-action-confirm', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': csrfToken
+            },
+            body: JSON.stringify({ escrowId, txHash, actor: actor || '', action })
+        });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            throw { code: 'CONFIRM_FAILED', message: data.error || `Confirm failed (HTTP ${resp.status})` };
+        }
+        const data = await resp.json();
+        if (data.success === false) {
+            throw { code: 'CONFIRM_REFUSED', message: data.error || 'Confirm refused.' };
+        }
+        return data;
+    }
+
+    // ── Cross-chain swap relay (no API key; CSRF only) ─────────────────────
+    // Broadcasts an EIP-3009 authorization bound to a checkout on the source
+    // chain. Validated by SwapController::relay() (payer/to/nonce binding).
+    async function swapRelay(params) {
+        const { checkoutId, sourceChainId, sourceToken, from, to, value, validAfter, validBefore, nonce, signature } = params || {};
+        if (!checkoutId || !sourceChainId || !from || !to || !value || !validAfter || !validBefore || !nonce || !signature) {
+            throw { code: 'INVALID_PARAMS', message: 'checkoutId, sourceChainId, from, to, value, validAfter, validBefore, nonce and signature are required.' };
+        }
+
+        const body = {
+            checkoutId: String(checkoutId),
+            sourceChainId: Number(sourceChainId),
+            sourceToken: sourceToken || '',
+            from, to, value: String(value),
+            validAfter: String(validAfter), validBefore: String(validBefore),
+            nonce, signature
+        };
+
+        const headers = { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken };
+        const resp = await _fetchWithTimeout(swapRelayUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body)
+        });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            throw { code: 'SWAP_RELAY_FAILED', message: data.error || `Swap relay failed (HTTP ${resp.status})` };
+        }
+        const data = await resp.json();
+        if (data.success === false) {
+            throw { code: 'SWAP_RELAY_REFUSED', message: data.error || 'Swap relay refused.' };
         }
         return data;
     }
@@ -813,7 +890,7 @@ function onAccountChanged(callback) {
     function getProvider() { return _provider; }
     function isConnected() { return !!_address; }
     function getConfig() {
-        return { gatewayAddress, tokenAddress, relayUrl, chainIdExpected, decimals, hasApiKey: !!apiKey };
+        return { gatewayAddress, tokenAddress, relayUrl, swapRelayUrl, chainIdExpected, decimals, hasApiKey: !!apiKey };
     }
 
     return {
@@ -844,6 +921,8 @@ function onAccountChanged(callback) {
 
         signTransferWithAuthorization,
         relayTransfer,
+        confirmEscrowAction,
+        swapRelay,
 
         approveGateway,
         getAMHRBalance,
@@ -893,6 +972,7 @@ export async function createAmahoroPayAsync(config) {
         gatewayAbi = MINIMAL_GATEWAY_ABI,
         tokenAbi = MINIMAL_TOKEN_ABI,
         relayUrl = '?page=relay',
+        swapRelayUrl = '?page=swap-relay',
         chainIdExpected = null,
         decimals = 18,
         csrfToken: csrfTokenOverride,
@@ -939,9 +1019,11 @@ export async function createAmahoroPayAsync(config) {
         gatewayAbi,
         tokenAbi,
         relayUrl: relayUrl || serverConfig.relayUrl,
+        swapRelayUrl: swapRelayUrl || serverConfig.swapRelayUrl,
         chainIdExpected: chainIdExpected ?? serverConfig.chainIdExpected,
         decimals: decimals ?? serverConfig.decimals,
         csrfToken: csrfTokenOverride,
+        apiKey: apiKey || serverConfig.apiKey,
         maxFeeBps,
         maxBatchAmount,
         requestTimeout,

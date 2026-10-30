@@ -146,6 +146,30 @@ const result = await pay.relayTransfer({
 });
 ```
 
+### Escrow Confirmation (server-side DB flip)
+After `depositEscrow()`, `releaseEscrow()`, or `refundEscrow()`, confirm the
+action in the SaaS DB once the on-chain event is verified:
+```js
+await pay.confirmEscrowAction({
+  escrowId,  // bytes32 escrow id
+  txHash,    // on-chain transaction hash
+  actor,     // wallet that signed (payer for deposit/refund, merchant for release)
+  action: 'deposit' | 'release' | 'refund'
+});
+```
+
+### Cross-Chain Swap Relay
+Broadcast an EIP-3009 authorization bound to a checkout on the source chain
+(no API key required; CSRF token only). Validated by the backend before broadcast:
+```js
+const result = await pay.swapRelay({
+  checkoutId,       // checkout id (numeric)
+  sourceChainId,    // source chain id (e.g. 31337)
+  sourceToken,      // optional source asset token address
+  from, to, value, validAfter, validBefore, nonce, signature  // from signTransferWithAuthorization
+});
+```
+
 ## Configuration
 
 ```js
@@ -156,8 +180,9 @@ const pay = createAmahoroPay({
   tokenAddress: '0x...',       // Token address (AMHR/USDC)
   gatewayAbi: [...],           // optional custom ABI
   tokenAbi: [...],             // optional custom token ABI
-  relayUrl: '?page=relay',     // your relay endpoint
-  apiKey: 'ak_...',            // for authenticated endpoints
+  relayUrl: '?page=relay',     // your relay endpoint (API key required)
+  swapRelayUrl: '?page=swap-relay', // your swap relay endpoint (CSRF only)
+  apiKey: 'ak_...',            // for authenticated relay endpoints
   chainIdExpected: 42220,      // validate chain
   decimals: 18,                // token decimals
   csrfToken: '',               // CSRF token for POST requests
